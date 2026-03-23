@@ -1,0 +1,401 @@
+// ==UserScript==
+// @name         4chan Media Viewer (Ultra Lite + Premium UI)
+// @namespace    http://tampermonkey.net/
+// @version      3.0.0
+// @description  Visualizador minimalista ultra rápido. Sin prefetch agresivo, barra flotante inteligente, íconos SVG, animaciones fluidas y precarga nativa del siguiente archivo.
+// @author       You
+// @match        https://boards.4chan.org/*/thread/*
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // --- Estado Global ---
+  let mediaLinks = [];
+  let currentIndex = 0;
+  let isViewerOpen = false;
+  let persistentVideo = null;
+  let hideCursorTimer = null;
+  let defaultMuted = false;
+
+  // Estado para Zoom y Paneo
+  const ptr = { scale: 1, tx: 0, ty: 0, panning: false, sx: 0, sy: 0 };
+
+  // --- Iconos SVG ---
+  const icons = {
+    prev: `<svg viewBox="0 0 24 24"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"/></svg>`,
+    next: `<svg viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>`,
+    zoomIn: `<svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zm.5-7H9v2H7v1h2v2h1v-2h2V9h-2V7z"/></svg>`,
+    zoomOut: `<svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM7 9h5v1H7V9z"/></svg>`,
+    reset: `<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11h-4v4h-2v-4H7v-2h4V7h2v4h4v2z"/></svg>`,
+    mute: `<svg viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>`,
+    full: `<svg viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>`,
+    close: `<svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>`
+  };
+
+  // --- Estilos CSS Inyectados ---
+  function injectStyles() {
+    const css = `
+      #mv-container { position: fixed; inset: 0; display: none; background: #000; z-index: 999999; opacity: 0; transition: opacity 0.3s ease; }
+      #mv-container.mv-open { display: flex; opacity: 1; }
+      #mv-main { flex: 1; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: default; }
+      #mv-main.hide-cursor { cursor: none !important; }
+      #mv-sidebar { width: 260px; background: #0a0a0a; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 6px; border-left: 1px solid #222; scroll-behavior: smooth; }
+
+      .mv-thumb { width: 100%; height: 110px; object-fit: cover; cursor: pointer; border-radius: 6px; border: 2px solid transparent; opacity: 0.6; transition: all 0.2s; background: #111; }
+      .mv-thumb:hover { opacity: 1; transform: scale(1.02); }
+      .mv-thumb.is-active { border-color: #2d6cdf; opacity: 1; }
+
+      .mv-content { max-width: 100%; max-height: 100%; transform-origin: center center; opacity: 0; transition: opacity 0.25s ease; user-select: none; }
+      .mv-content.loaded { opacity: 1; }
+
+      #mv-toolbar { position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); background: rgba(15, 15, 15, 0.85); backdrop-filter: blur(8px); border: 1px solid #333; border-radius: 16px; display: flex; align-items: center; gap: 8px; padding: 8px 16px; transition: all 0.3s ease; z-index: 10; }
+      #mv-main.hide-cursor #mv-toolbar { opacity: 0; transform: translate(-50%, 20px); pointer-events: none; }
+
+      .mv-btn { background: transparent; border: none; color: #fff; cursor: pointer; padding: 8px; border-radius: 8px; display: flex; align-items: center; justify-content: center; transition: background 0.2s; }
+      .mv-btn:hover { background: rgba(255, 255, 255, 0.15); }
+      .mv-btn svg { width: 22px; height: 22px; fill: currentColor; }
+
+      #mv-counter { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 600; color: #fff; min-width: 80px; text-align: center; margin: 0 8px; }
+
+      #mv-close-btn { position: absolute; top: 20px; left: 20px; background: rgba(15, 15, 15, 0.85); backdrop-filter: blur(8px); color: #fff; border: 1px solid #333; border-radius: 50%; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.3s; z-index: 10; }
+      #mv-close-btn:hover { background: #d32f2f; border-color: #d32f2f; transform: scale(1.05); }
+      #mv-main.hide-cursor #mv-close-btn { opacity: 0; pointer-events: none; }
+
+      /* Ocultar barra de scroll en sidebar para mayor limpieza */
+      #mv-sidebar::-webkit-scrollbar { width: 6px; }
+      #mv-sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+    `;
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  // --- UI Builder ---
+  function buildUI() {
+    injectStyles();
+
+    const container = document.createElement('div');
+    container.id = 'mv-container';
+
+    const main = document.createElement('div');
+    main.id = 'mv-main';
+
+    // Barra de herramientas flotante
+    const toolbar = document.createElement('div');
+    toolbar.id = 'mv-toolbar';
+
+    const btnPrev = createBtn(icons.prev, () => nav(-1));
+    const btnNext = createBtn(icons.next, () => nav(1));
+    const btnZoomIn = createBtn(icons.zoomIn, () => adjustZoom(0.15));
+    const btnZoomOut = createBtn(icons.zoomOut, () => adjustZoom(-0.15));
+    const btnReset = createBtn(icons.reset, resetZoom);
+    const counter = document.createElement('div');
+    counter.id = 'mv-counter';
+    const btnMute = createBtn(icons.mute, toggleMute);
+    const btnFull = createBtn(icons.full, toggleFullscreen);
+
+    toolbar.append(btnPrev, btnNext, btnZoomIn, btnZoomOut, btnReset, counter, btnMute, btnFull);
+
+    const btnClose = createBtn(icons.close, closeViewer);
+    btnClose.id = 'mv-close-btn';
+
+    const contentHolder = document.createElement('div');
+    contentHolder.id = 'mv-content-holder';
+    contentHolder.style.cssText = 'width:100%; height:100%; display:flex; align-items:center; justify-content:center;';
+
+    main.append(btnClose, contentHolder, toolbar);
+
+    const sidebar = document.createElement('div');
+    sidebar.id = 'mv-sidebar';
+
+    container.append(main, sidebar);
+    document.body.appendChild(container);
+
+    // Eventos del ratón para Zoom/Pan y auto-ocultado
+    bindPointerEvents(main);
+
+    // Auto-ocultar UI
+    main.addEventListener('mousemove', resetHideTimer);
+    main.addEventListener('mousedown', resetHideTimer);
+    document.addEventListener('keydown', (e) => { if (isViewerOpen) resetHideTimer(); });
+  }
+
+  function createBtn(svgInfo, onClick) {
+    const b = document.createElement('button');
+    b.className = 'mv-btn';
+    b.innerHTML = svgInfo;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  // --- Core Logic ---
+  function refreshMediaLinks() {
+    const nodes = Array.from(document.querySelectorAll('.postContainer a.fileThumb'));
+    mediaLinks = nodes.map(a => {
+      const img = a.querySelector('img');
+      return a.href ? { href: a.href, preview: img ? img.src : '' } : null;
+    }).filter(Boolean);
+  }
+
+  function openViewer(startIndex) {
+    currentIndex = startIndex;
+    isViewerOpen = true;
+    document.getElementById('mv-container').classList.add('mv-open');
+    document.body.style.overflow = 'hidden'; // Evitar scroll de la página de fondo
+    populateThumbnails();
+    updateContent();
+  }
+
+  function closeViewer() {
+    isViewerOpen = false;
+    document.getElementById('mv-container').classList.remove('mv-open');
+    document.body.style.overflow = '';
+    if (persistentVideo) persistentVideo.pause();
+    if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  }
+
+  function isVideo(href) { return /\.(webm|mp4)$/i.test(href); }
+
+  function getPersistentVideo() {
+    if (!persistentVideo) {
+      persistentVideo = document.createElement('video');
+      persistentVideo.className = 'mv-content';
+      persistentVideo.controls = true;
+      persistentVideo.autoplay = true;
+      persistentVideo.loop = true;
+      persistentVideo.muted = defaultMuted;
+      persistentVideo.addEventListener('ended', () => nav(1)); // Saltar al siguiente al terminar
+      persistentVideo.addEventListener('canplay', () => persistentVideo.classList.add('loaded'));
+    }
+    return persistentVideo;
+  }
+
+  async function updateContent() {
+    const holder = document.getElementById('mv-content-holder');
+    if (!holder || !mediaLinks.length) return;
+
+    resetZoom();
+    holder.innerHTML = '';
+    const src = mediaLinks[currentIndex].href;
+
+    if (isVideo(src)) {
+      const v = getPersistentVideo();
+      v.classList.remove('loaded');
+      v.src = src;
+      holder.appendChild(v);
+      v.play().catch(()=>{});
+    } else {
+      if (persistentVideo) persistentVideo.pause();
+      const img = new Image();
+      img.className = 'mv-content';
+      img.onload = () => img.classList.add('loaded');
+      img.src = src;
+      holder.appendChild(img);
+    }
+
+    // Actualizar Contador "1 de 123"
+    document.getElementById('mv-counter').textContent = `${currentIndex + 1} de ${mediaLinks.length}`;
+
+    updateActiveThumbnail();
+    microPreload();
+  }
+
+  // --- Micro-Preload Nativo ---
+  function microPreload() {
+    // Solo precarga silenciosamente el archivo que sigue directamente
+    const nextIdx = currentIndex + 1;
+    if (nextIdx >= mediaLinks.length) return;
+    const src = mediaLinks[nextIdx].href;
+
+    if (isVideo(src)) {
+      const v = document.createElement('video');
+      v.preload = 'auto'; // El navegador almacena en caché nativo
+      v.src = src;
+    } else {
+      const i = new Image();
+      i.src = src;
+    }
+  }
+
+  // --- Thumbnails ---
+  function populateThumbnails() {
+    const sidebar = document.getElementById('mv-sidebar');
+    sidebar.innerHTML = '';
+    mediaLinks.forEach((m, i) => {
+      const img = document.createElement('img');
+      img.className = 'mv-thumb';
+      img.loading = 'lazy';
+      img.src = m.preview || m.href;
+      img.dataset.index = i;
+      img.addEventListener('click', () => { currentIndex = i; updateContent(); });
+      sidebar.appendChild(img);
+    });
+  }
+
+  function updateActiveThumbnail() {
+    const thumbs = document.querySelectorAll('#mv-sidebar .mv-thumb');
+    thumbs.forEach(t => t.classList.remove('is-active'));
+    const active = thumbs[currentIndex];
+    if (active) {
+      active.classList.add('is-active');
+      active.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+
+  // --- Navegación ---
+  function nav(dir) {
+    let next = currentIndex + dir;
+    if (next < 0) next = 0;
+    if (next >= mediaLinks.length) next = mediaLinks.length - 1;
+    if (next !== currentIndex) {
+      currentIndex = next;
+      updateContent();
+    }
+  }
+
+  // --- Zoom y Paneo ---
+  function bindPointerEvents(main) {
+    main.addEventListener('wheel', (e) => {
+      const el = document.querySelector('.mv-content');
+      if (!el || el.tagName === 'VIDEO') return;
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      adjustZoom(delta);
+    }, { passive: false });
+
+    main.addEventListener('pointerdown', (e) => {
+      const el = document.querySelector('.mv-content');
+      if (!el || el.tagName === 'VIDEO' || e.button !== 0) return; // Solo clic izquierdo
+      ptr.panning = true;
+      ptr.sx = e.clientX;
+      ptr.sy = e.clientY;
+      main.setPointerCapture(e.pointerId);
+    });
+
+    main.addEventListener('pointermove', (e) => {
+      if (!ptr.panning) return;
+      ptr.tx += (e.clientX - ptr.sx);
+      ptr.ty += (e.clientY - ptr.sy);
+      ptr.sx = e.clientX;
+      ptr.sy = e.clientY;
+      applyTransform();
+    });
+
+    main.addEventListener('pointerup', () => ptr.panning = false);
+    main.addEventListener('dblclick', resetZoom);
+  }
+
+  function adjustZoom(delta) {
+    const newScale = ptr.scale + delta;
+    ptr.scale = Math.max(0.5, Math.min(newScale, 8)); // Límite de zoom entre 0.5x y 8x
+    applyTransform();
+  }
+
+  function resetZoom() {
+    ptr.scale = 1; ptr.tx = 0; ptr.ty = 0;
+    applyTransform();
+  }
+
+  function applyTransform() {
+    const el = document.querySelector('.mv-content');
+    if (!el || el.tagName === 'VIDEO') return;
+
+    // Límite de paneo suave: evitar que la imagen se pierda fuera del monitor
+    const boundX = window.innerWidth * 0.7;
+    const boundY = window.innerHeight * 0.7;
+    ptr.tx = Math.max(-boundX, Math.min(boundX, ptr.tx));
+    ptr.ty = Math.max(-boundY, Math.min(boundY, ptr.ty));
+
+    el.style.transform = `translate(${ptr.tx}px, ${ptr.ty}px) scale(${ptr.scale})`;
+  }
+
+  // --- Interacciones extra ---
+  function resetHideTimer() {
+    const main = document.getElementById('mv-main');
+    if (!main) return;
+    main.classList.remove('hide-cursor');
+    clearTimeout(hideCursorTimer);
+    hideCursorTimer = setTimeout(() => { main.classList.add('hide-cursor'); }, 2500);
+  }
+
+  function toggleMute() {
+    if (persistentVideo) {
+      persistentVideo.muted = !persistentVideo.muted;
+      defaultMuted = persistentVideo.muted;
+    }
+  }
+
+  function toggleFullscreen() {
+    const v = document.querySelector('.mv-content');
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(()=>{});
+    } else if (v && v.tagName === 'VIDEO') {
+      v.requestFullscreen().catch(()=>{});
+    }
+  }
+
+  // --- Atajos de teclado unificados ---
+  document.addEventListener('keydown', (e) => {
+    if (!isViewerOpen) return;
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;
+
+    switch (e.key) {
+      case 'ArrowRight': e.preventDefault(); nav(1); break;
+      case 'ArrowLeft': e.preventDefault(); nav(-1); break;
+      case 'ArrowUp':
+        e.preventDefault();
+        if (persistentVideo && persistentVideo.isConnected) persistentVideo.volume = Math.min(1, persistentVideo.volume + 0.1);
+        else adjustZoom(0.2);
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        if (persistentVideo && persistentVideo.isConnected) persistentVideo.volume = Math.max(0, persistentVideo.volume - 0.1);
+        else adjustZoom(-0.2);
+        break;
+      case 'f': case 'F': e.preventDefault(); toggleFullscreen(); break;
+      case 'm': case 'M': e.preventDefault(); toggleMute(); break;
+      case 'Escape': e.preventDefault(); closeViewer(); break;
+    }
+  });
+
+  // --- Interceptar clicks en miniaturas de 4chan ---
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a.fileThumb');
+    if (a && !e.ctrlKey && !e.shiftKey) {
+      e.preventDefault();
+      refreshMediaLinks();
+      const idx = mediaLinks.findIndex(m => m.href === a.href);
+      if (idx >= 0) openViewer(idx);
+    }
+  }, true);
+
+  // --- Observer Optimizado ---
+  const observer = new MutationObserver((mutations) => {
+    let shouldRefresh = false;
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType === 1 && (node.classList.contains('postContainer') || node.querySelector('.postContainer'))) {
+          shouldRefresh = true; break;
+        }
+      }
+      if (shouldRefresh) break;
+    }
+    if (shouldRefresh) {
+      refreshMediaLinks();
+      if (isViewerOpen) {
+        populateThumbnails();
+        updateActiveThumbnail();
+        document.getElementById('mv-counter').textContent = `${currentIndex + 1} de ${mediaLinks.length}`;
+      }
+    }
+  });
+
+  // Iniciar extension
+  buildUI();
+  refreshMediaLinks();
+  observer.observe(document.body, { childList: true, subtree: true });
+
+})();
